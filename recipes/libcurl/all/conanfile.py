@@ -1,6 +1,5 @@
 import os
 import re
-import shutil
 from conans import ConanFile, AutoToolsBuildEnvironment, RunEnvironment, CMake, tools
 from conans.errors import ConanInvalidConfiguration
 
@@ -30,7 +29,8 @@ class LibcurlConan(ConanFile):
                "with_libpsl": [True, False],
                "with_largemaxwritesize": [True, False],
                "with_nghttp2": [True, False],
-               "with_brotli": [True, False]}
+               "with_brotli": [True, False]
+               }
     default_options = {'shared': False,
                        'fPIC': True,
                        'with_openssl': True,
@@ -46,14 +46,20 @@ class LibcurlConan(ConanFile):
                        'with_nghttp2': False,
                        'with_brotli': False
                        }
-
     _source_subfolder = "source_subfolder"
     _build_subfolder = "build_subfolder"
     _autotools = False
 
+    _cmake = None
+
     @property
     def _is_mingw(self):
         return self.settings.os == "Windows" and self.settings.compiler != "Visual Studio"
+
+    @property
+    def _is_win_x_android(self):
+        return self.settings.os == "Android" and tools.os_info.is_windows
+
 
     def imports(self):
         # Copy shared libraries for dependencies to fix DYLD_LIBRARY_PATH problems
@@ -68,13 +74,14 @@ class LibcurlConan(ConanFile):
             self.copy("*.dylib*", dst=self._source_subfolder, keep_path=False)
 
     def config_options(self):
-        if self.settings.os != "Macos":
-            self.options.remove("darwin_ssl")
+        if not tools.is_apple_os(self.settings.os):
+            del self.options.darwin_ssl
+
         if self.settings.os != "Windows":
-            self.options.remove("with_winssl")
+            del self.options.with_winssl
 
         if self.settings.os == "Windows":
-            self.options.remove("fPIC")
+            del self.options.fPIC
 
     def configure(self):
         del self.settings.compiler.libcxx
@@ -92,7 +99,7 @@ class LibcurlConan(ConanFile):
 
         if self.options.with_openssl:
             # enforce shared linking due to openssl dependency
-            if self.settings.os != "Macos" or not self.options.darwin_ssl:
+            if not tools.is_apple_os(self.settings.os) or not self.options.darwin_ssl:
                 self.options["openssl"].shared = self.options.shared
         if self.options.with_libssh2:
             if self.settings.compiler != "Visual Studio":
@@ -100,25 +107,31 @@ class LibcurlConan(ConanFile):
 
     def system_requirements(self):
         # TODO: Declare tools needed to compile. The idea is Conan checking that they are
-        #   installed and providing a meaninful message before starting the compilation. It
+        #   installed and providing a meaningful message before starting the compilation. It
         #   would be much better than installed them (sudo required).
         pass
 
+    def build_requirements(self):
+        if self._is_win_x_android:
+            self.build_requires("ninja/1.9.0")
+        elif self.settings.os == "Linux":
+            self.build_requires("libtool/2.4.6")
+
     def requirements(self):
         if self.options.with_openssl:
-            if self.settings.os == "Macos" and self.options.darwin_ssl:
+            if tools.is_apple_os(self.settings.os) and self.options.darwin_ssl:
                 pass
             elif self.settings.os == "Windows" and self.options.with_winssl:
                 pass
             else:
-                self.requires.add("openssl/1.1.1d")
+                self.requires("openssl/1.1.1g")
         if self.options.with_libssh2:
             if self.settings.compiler != "Visual Studio":
-                self.requires.add("libssh2/1.9.0")
+                self.requires("libssh2/1.9.0")
         if self.options.with_nghttp2:
-            self.requires.add("libnghttp2/1.40.0")
+            self.requires("libnghttp2/1.40.0")
 
-        self.requires.add("zlib/1.2.11")
+        self.requires("zlib/1.2.11")
 
     def source(self):
         tools.get(**self.conan_data["sources"][self.version])
@@ -127,10 +140,11 @@ class LibcurlConan(ConanFile):
 
     def build(self):
         self._patch_misc_files()
-        if self.settings.compiler != "Visual Studio":
-            self._build_with_autotools()
-        else:
+        if self.settings.compiler == "Visual Studio" or self._is_win_x_android:
             self._build_with_cmake()
+        else:
+            self._build_with_autotools()
+
 
     def _patch_misc_files(self):
         if self.options.with_largemaxwritesize:
@@ -139,6 +153,7 @@ class LibcurlConan(ConanFile):
                                   "define CURL_MAX_WRITE_SIZE 10485760")
 
         # https://github.com/curl/curl/issues/2835
+        # for additional info, see this comment https://github.com/conan-io/conan-center-index/pull/1008#discussion_r386122685
         if self.settings.compiler == 'apple-clang' and self.settings.compiler.version == '9.1':
             if self.options.darwin_ssl:
                 tools.replace_in_file(os.path.join(self._source_subfolder, 'lib', 'vtls', 'sectransp.c'),
@@ -153,7 +168,7 @@ class LibcurlConan(ConanFile):
         params.append("--without-libpsl" if not self.options.with_libpsl else "--with-libpsl")
         params.append("--without-brotli" if not self.options.with_brotli else "--with-brotli")
 
-        if self.settings.os == "Macos" and self.options.darwin_ssl:
+        if tools.is_apple_os(self.settings.os) and self.options.darwin_ssl:
             params.append("--with-darwinssl")
             params.append("--without-ssl")
         elif self.settings.os == "Windows" and self.options.with_winssl:
@@ -191,8 +206,14 @@ class LibcurlConan(ConanFile):
         if tools.cross_building(self.settings):
             if self.settings.os == "Linux" and "arm" in self.settings.arch:
                 params.append('--host=%s' % self._get_linux_arm_host())
+            elif self.settings.os == "iOS":
+                params.append("--enable-threaded-resolver")
+                params.append("--disable-verbose")
+            elif self.settings.os == "Android":
+                pass # this just works, conan is great!
 
         return params
+
 
     def _get_linux_arm_host(self):
         arch = None
@@ -207,6 +228,8 @@ class LibcurlConan(ConanFile):
                 arch = 'arm-linux-gnueabi'
         return arch
 
+    # TODO, this should be a inner fuction of _get_linux_arm_host since it is only used from there
+    # it should not polute the class namespace, since there are iOS and Android arm aritectures also
     def _arm_version(self, arch):
         version = None
         match = re.match(r"arm\w*(\d)", arch)
@@ -235,6 +258,12 @@ class LibcurlConan(ConanFile):
                                   '-lz ',
                                   '-lzlib ')
 
+        # patch for openssl extras in mingw
+        if self.options.with_openssl:
+            tools.replace_in_file("configure",
+                                  '-lcrypto ',
+                                  '-lcrypto -lcrypt32 ')
+
         if self.options.shared:
             # patch for shared mingw build
             tools.replace_in_file(os.path.join('lib', 'Makefile.am'),
@@ -253,24 +282,23 @@ class LibcurlConan(ConanFile):
                 tools.save(os.path.join('lib', 'Makefile.am'), added_content, append=True)
 
     def _build_with_autotools(self):
-        env_run = RunEnvironment(self)
-        # run configure with *LD_LIBRARY_PATH env vars
-        # it allows to pick up shared openssl
-        self.output.info("Run vars: " + repr(env_run.vars))
-        with tools.environment_append(env_run.vars):
-            with tools.chdir(self._source_subfolder):
-                use_win_bash = self._is_mingw and not tools.cross_building(self.settings)
-                autotools, autotools_vars = self._configure_autotools()
+        with tools.chdir(self._source_subfolder):
+            use_win_bash = self._is_mingw and not tools.cross_building(self.settings)
 
-                # autoreconf
-                self.run('./buildconf', win_bash=use_win_bash)
+            # autoreconf
+            self.run('./buildconf', win_bash=use_win_bash, run_environment=True)
 
-                # fix generated autotools files
+            # fix generated autotools files on alle to have relocateable binaries
+            if tools.is_apple_os(self.settings.os):
                 tools.replace_in_file("configure", "-install_name \\$rpath/", "-install_name ")
-                self.run("chmod +x configure")
 
-                configure_args = self._get_configure_command_args()
-                autotools.configure(vars=autotools_vars, args=configure_args)
+            self.run("chmod +x configure")
+
+            env_run = RunEnvironment(self)
+            # run configure with *LD_LIBRARY_PATH env vars it allows to pick up shared openssl
+            self.output.info("Run vars: " + repr(env_run.vars))
+            with tools.environment_append(env_run.vars):
+                autotools, autotools_vars = self._configure_autotools()
                 autotools.make(vars=autotools_vars)
 
     def _configure_autotools_vars(self):
@@ -285,9 +313,58 @@ class LibcurlConan(ConanFile):
 
             del autotools_vars['LIBS']
             self.output.info("Autotools env vars: " + repr(autotools_vars))
+
+        if tools.cross_building(self.settings):
+            if self.settings.os == "iOS":
+                iphoneos = tools.apple_sdk_name(self.settings)
+                ios_dev_target = str(self.settings.os.version).split(".")[0]
+                if self.settings.arch in ["x86", "x86_64"]:
+                    autotools_vars['CPPFLAGS'] = "-D__IPHONE_OS_VERSION_MIN_REQUIRED={}0000".format(ios_dev_target)
+                elif self.settings.arch in ["armv7", "armv7s", "armv8"]:
+                    autotools_vars['CPPFLAGS'] = ""
+                else:
+                    raise ConanInvalidConfiguration("Unsuported iOS arch {}".format(self.settings.arch))
+
+                cc = tools.XCRun(self.settings, iphoneos).cc
+                sysroot = "-isysroot {}".format(tools.XCRun(self.settings, iphoneos).sdk_path)
+
+                if self.settings.arch == "armv8":
+                    configure_arch = "arm64"
+                    configure_host = "arm" #unused, autodetected
+                else:
+                    configure_arch = self.settings.arch
+                    configure_host = self.settings.arch #unused, autodetected
+
+
+                arch_flag = "-arch {}".format(configure_arch)
+                ios_min_version = tools.apple_deployment_target_flag(self.settings.os, self.settings.os.version)
+                extra_flag = "-Werror=partial-availability"
+                extra_def = " -DHAVE_SOCKET -DHAVE_FCNTL_O_NONBLOCK"
+                # if we debug, maybe add a -gdwarf-2 , but why would we want that?
+
+                autotools_vars['CC'] = cc
+                autotools_vars['IPHONEOS_DEPLOYMENT_TARGET'] = ios_dev_target
+                autotools_vars['CFLAGS'] = "{} {} {} {}".format(
+                    sysroot, arch_flag, ios_min_version, extra_flag
+                )
+
+                if self.options.with_openssl:
+                    openssl_path = self.deps_cpp_info["openssl"].rootpath
+                    openssl_libdir = self.deps_cpp_info["openssl"].libdirs[0]
+                    autotools_vars['LDFLAGS'] = "{} {} -L{}/{}".format(arch_flag, sysroot, openssl_path, openssl_libdir)
+                else:
+                    autotools_vars['LDFLAGS'] = "{} {}".format(arch_flag, sysroot)
+
+                autotools_vars['CPPFLAGS'] += extra_def
+
+            elif self.settings.os == "Android":
+                # nothing do to at the moment, this seems to just work
+                pass
+
         return autotools_vars
 
     def _configure_autotools(self):
+
         if not self._autotools:
             use_win_bash = self._is_mingw and not tools.cross_building(self.settings)
             self._autotools = AutoToolsBuildEnvironment(self, win_bash=use_win_bash)
@@ -305,26 +382,37 @@ class LibcurlConan(ConanFile):
                 self._autotools.defines.append('_AMD64_')
 
             configure_args = self._get_configure_command_args()
-            self._autotools.configure(vars=autotools_vars, args=configure_args)
+
+            if self.settings.os == "iOS" and self.settings.arch == "x86_64":
+                # please do not autodetect --build for the iOS simulator, thanks!
+                self._autotools.configure(vars=autotools_vars, args=configure_args, build=False)
+            else:
+                self._autotools.configure(vars=autotools_vars, args=configure_args)
+
 
         return self._autotools, self._configure_autotools_vars()
 
     def _configure_cmake(self):
-        cmake = CMake(self)
-        cmake.definitions['BUILD_TESTING'] = False
-        cmake.definitions['BUILD_CURL_EXE'] = False
-        cmake.definitions['CURL_DISABLE_LDAP'] = not self.options.with_ldap
-        cmake.definitions['BUILD_SHARED_LIBS'] = self.options.shared
-        cmake.definitions['CURL_STATICLIB'] = not self.options.shared
-        cmake.definitions['CMAKE_DEBUG_POSTFIX'] = ''
-        cmake.definitions['CMAKE_USE_LIBSSH2'] = self.options.with_libssh2
+        if self._cmake:
+            return self._cmake
+        if self._is_win_x_android:
+            self._cmake = CMake(self, generator="Ninja")
+        else:
+            self._cmake = CMake(self)
+        self._cmake.definitions['BUILD_TESTING'] = False
+        self._cmake.definitions['BUILD_CURL_EXE'] = False
+        self._cmake.definitions['CURL_DISABLE_LDAP'] = not self.options.with_ldap
+        self._cmake.definitions['BUILD_SHARED_LIBS'] = self.options.shared
+        self._cmake.definitions['CURL_STATICLIB'] = not self.options.shared
+        self._cmake.definitions['CMAKE_DEBUG_POSTFIX'] = ''
+        self._cmake.definitions['CMAKE_USE_LIBSSH2'] = self.options.with_libssh2
 
         # all these options are exclusive. set just one of them
         # mac builds do not use cmake so don't even bother about darwin_ssl
-        cmake.definitions['CMAKE_USE_WINSSL'] = 'with_winssl' in self.options and self.options.with_winssl
-        cmake.definitions['CMAKE_USE_OPENSSL'] = 'with_openssl' in self.options and self.options.with_openssl
-        cmake.configure(build_folder=self._build_subfolder)
-        return cmake
+        self._cmake.definitions['CMAKE_USE_WINSSL'] = 'with_winssl' in self.options and self.options.with_winssl
+        self._cmake.definitions['CMAKE_USE_OPENSSL'] = 'with_openssl' in self.options and self.options.with_openssl
+        self._cmake.configure(build_folder=self._build_subfolder)
+        return self._cmake
 
     def _build_with_cmake(self):
         # patch cmake files
@@ -340,17 +428,15 @@ class LibcurlConan(ConanFile):
         self.copy(pattern="COPYING", dst="licenses", src=self._source_subfolder)
 
         # Execute install
-        if self.settings.compiler != "Visual Studio":
+        if self.settings.compiler == "Visual Studio" or self._is_win_x_android:
+            cmake = self._configure_cmake()
+            cmake.install()
+        else:
             env_run = RunEnvironment(self)
-
             with tools.environment_append(env_run.vars):
                 with tools.chdir(self._source_subfolder):
                     autotools, autotools_vars = self._configure_autotools()
                     autotools.install(vars=autotools_vars)
-        else:
-            cmake = self._configure_cmake()
-            cmake.install()
-
         if self._is_mingw:
             # Handle only mingw libs
             self.copy(pattern="*.dll", dst="bin", keep_path=False)
@@ -361,11 +447,11 @@ class LibcurlConan(ConanFile):
         self.copy("cacert.pem", dst="res")
 
         # no need to distribute share folder (docs/man pages)
-        shutil.rmtree(os.path.join(self.package_folder, 'share'), ignore_errors=True)
+        tools.rmdir(os.path.join(self.package_folder, 'share'))
         # no need for pc files
-        shutil.rmtree(os.path.join(self.package_folder, 'lib', 'pkgconfig'), ignore_errors=True)
+        tools.rmdir(os.path.join(self.package_folder, 'lib', 'pkgconfig'))
         # no need for cmake files
-        shutil.rmtree(os.path.join(self.package_folder, 'lib', 'cmake'), ignore_errors=True)
+        tools.rmdir(os.path.join(self.package_folder, 'lib', 'cmake'))
         # Remove libtool files (*.la)
         if os.path.isfile(os.path.join(self.package_folder, 'lib', 'libcurl.la')):
             os.remove(os.path.join(self.package_folder, 'lib', 'libcurl.la'))
